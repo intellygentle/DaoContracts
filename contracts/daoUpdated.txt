@@ -1,0 +1,392 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract FundingDAO is ReentrancyGuard {
+    struct Proposal {
+        string description;
+        address nominee; // Address proposed to receive funds
+        uint256 deadline;
+        uint256 yesVotes;
+        uint256 noVotes;
+        bool executed;
+        address proposer;
+        uint256 category; // 0: Funding, 1: Governance, 2: Community
+        uint256 whitelistedTimestamp; // Timestamp when proposal is whitelisted
+        uint256 creationFee; // Fee paid to create the proposal
+    }
+
+    mapping(uint256 => Proposal) public proposals;
+    mapping(address => uint256) public depositedAmount; // Tracks deposited MON
+    mapping(address => uint256) public stakedAmount; // Tracks staked MON
+    mapping(address => uint256) public votingPower; // Calculated voting power
+    mapping(address => uint256) public voteDeposits; // Tracks vote deposits
+    mapping(uint256 => mapping(address => bool)) public hasVoted;
+    mapping(address => bool) public isWorthy; // Worthy candidates
+    mapping(address => bool) public isWhitelisted; // Deployer-approved
+    mapping(address => uint256) public lastProposalTime;
+    mapping(address => uint256) public lastVoteTime;
+    mapping(address => uint256) public totalFundsReceived; // Tracks funds received by each address
+    mapping(uint256 => mapping(address => bool)) public votedYes; // Tracks who voted "yes" on each proposal
+    mapping(address => uint256) public slashedAmount; // Tracks slashed amounts for bad actors
+    mapping(address => uint256) public reputation; // New: Reputation for weighted voting
+    mapping(uint256 => bool) public activeProposals; // New: Tracks active proposal IDs
+    mapping(address => uint256) public lastVotedProposalId; // New: Tracks the last proposal a user voted on
+
+    uint256 public totalProposals;
+    uint256 public activeProposalCount; // New: Tracks the number of active proposals
+    uint256 public votingDuration = 10 minutes;
+    uint256 public proposalCooldown = 1 hours;
+    uint256 public voteCooldown = 5 minutes;
+    uint256 public unstakeAfterVoteCooldown = 15 minutes; // New: Cooldown before unstaking after voting
+    uint256 public stakingMultiplier = 2; // 2x voting power for staked MON
+    uint256 public fundingPercentage = 50; // Adjustable funding percentage
+    uint256 public executionTimeLimit = 1 days; // Time limit for executing a whitelisted proposal
+    uint256 public proposalCreationFee = 0.01 ether; // New: Fee to create a proposal
+    address public deployer;
+    bool public fundsReturned = false; // Flag for refund eligibility
+    bool public paused = false; // Emergency stop mechanism
+
+    // Constants for categories
+    uint256 public constant CATEGORY_FUNDING = 0;
+    uint256 public constant CATEGORY_GOVERNANCE = 1;
+    uint256 public constant CATEGORY_COMMUNITY = 2;
+
+    // Constants for slashing
+    uint256 public constant SLASH_THRESHOLD = 90; // Slash if no votes >= 90% of total votes
+    uint256 public constant SLASH_PERCENTAGE = 10; // Slash 10% of voting power for bad actors
+
+    // Events
+    event Deposited(address indexed user, uint256 amount);
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event ProposalCreated(uint256 indexed proposalId, address indexed proposer, address indexed nominee, string description, uint256 category, uint256 creationFee);
+    event Voted(uint256 indexed proposalId, address indexed voter, bool support, uint256 votingPower);
+    event ProposalExecuted(uint256 indexed proposalId, address indexed nominee, uint256 amount);
+    event Whitelisted(address indexed nominee, uint256 proposalId, uint256 timestamp);
+    event FundsReturnedMarked();
+    event VoteDepositWithdrawn(address indexed user, uint256 amount);
+    event FundingPercentageUpdated(uint256 newPercentage);
+    event Paused();
+    event Unpaused();
+    event RewardDistributed(address indexed voter, uint256 amount);
+    event Slashed(address indexed user, uint256 amount, string reason);
+    event ProposalCreationFeeRefunded(address indexed proposer, uint256 amount);
+    event EmergencyWithdraw(address indexed deployer, uint256 amount);
+
+    modifier onlyDeployer() {
+        require(msg.sender == deployer, "Not deployer");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
+        _;
+    }
+
+    constructor() {
+        deployer = msg.sender;
+        reputation[deployer] = 100; // Give deployer initial reputation
+    }
+
+    // New: Receive function to accept direct MON transfers
+    receive() external payable {
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // New: Fallback function for unexpected calls
+    fallback() external payable {
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // Deposit MON to gain voting power (1x)
+    function deposit() external payable whenNotPaused nonReentrant {
+        require(msg.value >= 0.001 ether, "Must deposit at least 0.001 MON");
+        depositedAmount[msg.sender] += msg.value;
+        votingPower[msg.sender] += msg.value; // 1x voting power for deposits
+        reputation[msg.sender] += 1; // Increase reputation slightly for participation
+        emit Deposited(msg.sender, msg.value);
+    }
+
+    // Stake deposited MON for bonus voting power (2x total for staked portion)
+    function stake(uint256 amount) external whenNotPaused nonReentrant {
+        require(depositedAmount[msg.sender] >= amount, "Not enough deposited");
+        require(amount >= 0.001 ether, "Minimum stake 0.001 MON");
+        depositedAmount[msg.sender] -= amount;
+        stakedAmount[msg.sender] += amount;
+        votingPower[msg.sender] += amount * (stakingMultiplier - 1); // Add 1x more (total 2x for staked)
+        reputation[msg.sender] += 2; // Increase reputation for staking
+        emit Staked(msg.sender, amount);
+    }
+
+    // Unstake MON (allowed before voting or after funds returned, with cooldown after voting)
+    function unstake(uint256 amount) external whenNotPaused nonReentrant {
+        require(stakedAmount[msg.sender] >= amount, "Not enough staked");
+        require(!isVotingActive() || fundsReturned, "Cannot unstake during voting");
+
+        // Check if the user has voted recently
+        if (lastVotedProposalId[msg.sender] != 0) {
+            Proposal storage lastVotedProposal = proposals[lastVotedProposalId[msg.sender]];
+            require(
+                block.timestamp >= lastVotedProposal.deadline + unstakeAfterVoteCooldown,
+                "Cannot unstake until cooldown after voting"
+            );
+        }
+
+        stakedAmount[msg.sender] -= amount;
+        depositedAmount[msg.sender] += amount;
+        votingPower[msg.sender] -= amount * (stakingMultiplier - 1); // Remove bonus power
+        emit Unstaked(msg.sender, amount);
+    }
+
+    // Signal interest in being a funding recipient
+    function makeMeWorthy() external whenNotPaused {
+        require(depositedAmount[msg.sender] > 0 || stakedAmount[msg.sender] > 0, "Must deposit/stake");
+        isWorthy[msg.sender] = true;
+    }
+
+    // Create a proposal to fund a worthy address (with creation fee)
+    function createProposal(string calldata description, address nominee, uint256 category) external payable whenNotPaused {
+        require(votingPower[msg.sender] > 0, "No voting power");
+        require(isWorthy[nominee], "Nominee not worthy");
+        require(block.timestamp >= lastProposalTime[msg.sender] + proposalCooldown, "Cooldown active");
+        require(category <= CATEGORY_COMMUNITY, "Invalid category");
+        require(msg.value == proposalCreationFee, "Must pay proposal creation fee");
+
+        proposals[totalProposals] = Proposal({
+            description: description,
+            nominee: nominee,
+            deadline: block.timestamp + votingDuration,
+            yesVotes: 0,
+            noVotes: 0,
+            executed: false,
+            proposer: msg.sender,
+            category: category,
+            whitelistedTimestamp: 0,
+            creationFee: msg.value
+        });
+        lastProposalTime[msg.sender] = block.timestamp;
+        activeProposals[totalProposals] = true; // Mark proposal as active
+        activeProposalCount++;
+        emit ProposalCreated(totalProposals, msg.sender, nominee, description, category, msg.value);
+        totalProposals++;
+    }
+
+    // Vote with 0.001 MON deposit, no self-voting, with cooldown, using weighted voting
+    function vote(uint256 proposalId, bool support) external payable whenNotPaused nonReentrant {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp < proposal.deadline, "Voting ended");
+        require(!hasVoted[proposalId][msg.sender], "Already voted");
+        require(votingPower[msg.sender] > 0, "No voting power");
+        require(msg.sender != proposal.nominee, "Cannot vote for yourself");
+        require(msg.value == 0.001 ether, "Must deposit 0.001 MON to vote");
+        require(block.timestamp >= lastVoteTime[msg.sender] + voteCooldown, "Vote cooldown active");
+
+        hasVoted[proposalId][msg.sender] = true;
+        voteDeposits[msg.sender] += msg.value;
+        lastVoteTime[msg.sender] = block.timestamp;
+        lastVotedProposalId[msg.sender] = proposalId; // Track the last voted proposal
+
+        // Weighted voting: voting power is adjusted by reputation
+        uint256 weightedPower = votingPower[msg.sender] * (reputation[msg.sender] + 1) / 100;
+        if (weightedPower == 0) weightedPower = votingPower[msg.sender]; // Fallback to base voting power if reputation is too low
+
+        if (support) {
+            proposal.yesVotes += weightedPower;
+            votedYes[proposalId][msg.sender] = true; // Track "yes" voters
+        } else {
+            proposal.noVotes += weightedPower;
+        }
+        emit Voted(proposalId, msg.sender, support, weightedPower);
+    }
+
+    // Batch vote on multiple proposals to stress-test the chain
+    function batchVote(uint256[] calldata proposalIds, bool[] calldata voteOption) external payable whenNotPaused nonReentrant {
+        require(proposalIds.length == voteOption.length, "Arrays length mismatch");
+        require(msg.value == 0.001 ether * proposalIds.length, "Incorrect vote deposit");
+        require(block.timestamp >= lastVoteTime[msg.sender] + voteCooldown, "Vote cooldown active");
+
+        for (uint256 i = 0; i < proposalIds.length; i++) {
+            uint256 proposalId = proposalIds[i];
+            bool support = voteOption[i];
+            Proposal storage proposal = proposals[proposalId];
+            require(block.timestamp < proposal.deadline, "Voting ended");
+            require(!hasVoted[proposalId][msg.sender], "Already voted");
+            require(votingPower[msg.sender] > 0, "No voting power");
+            require(msg.sender != proposal.nominee, "Cannot vote for yourself");
+
+            hasVoted[proposalId][msg.sender] = true;
+            lastVotedProposalId[msg.sender] = proposalId; // Track the last voted proposal
+
+            // Weighted voting
+            uint256 weightedPower = votingPower[msg.sender] * (reputation[msg.sender] + 1) / 100;
+            if (weightedPower == 0) weightedPower = votingPower[msg.sender];
+
+            if (support) {
+                proposal.yesVotes += weightedPower;
+                votedYes[proposalId][msg.sender] = true; // Track "yes" voters
+            } else {
+                proposal.noVotes += weightedPower;
+            }
+            emit Voted(proposalId, msg.sender, support, weightedPower);
+        }
+
+        voteDeposits[msg.sender] += msg.value;
+        lastVoteTime[msg.sender] = block.timestamp;
+    }
+
+    // Deployer whitelists a winning nominee after voting
+    function whitelistAddress(uint256 proposalId) external onlyDeployer {
+        Proposal storage proposal = proposals[proposalId];
+        require(block.timestamp >= proposal.deadline, "Voting still active");
+        require(!proposal.executed, "Already executed");
+        require(proposal.yesVotes > proposal.noVotes, "Did not pass");
+
+        // Check for slashing (if proposal is overwhelmingly rejected)
+        uint256 totalVotes = proposal.yesVotes + proposal.noVotes;
+        if (totalVotes > 0) {
+            uint256 noVotePercentage = (proposal.noVotes * 100) / totalVotes;
+            if (noVotePercentage >= SLASH_THRESHOLD) {
+                // Slash the proposer's voting power
+                uint256 slashAmount = (votingPower[proposal.proposer] * SLASH_PERCENTAGE) / 100;
+                if (slashAmount > 0) {
+                    votingPower[proposal.proposer] -= slashAmount;
+                    slashedAmount[proposal.proposer] += slashAmount;
+                    emit Slashed(proposal.proposer, slashAmount, "Proposal overwhelmingly rejected");
+                }
+            }
+        }
+
+        // Refund the proposal creation fee to the proposer
+        if (proposal.creationFee > 0 && address(this).balance >= proposal.creationFee) {
+            payable(proposal.proposer).transfer(proposal.creationFee);
+            emit ProposalCreationFeeRefunded(proposal.proposer, proposal.creationFee);
+        }
+
+        isWhitelisted[proposal.nominee] = true;
+        proposal.whitelistedTimestamp = block.timestamp;
+        activeProposals[proposalId] = false; // Mark proposal as inactive
+        activeProposalCount--;
+        emit Whitelisted(proposal.nominee, proposalId, block.timestamp);
+
+        // Distribute rewards to "yes" voters
+        distributeVoterRewards(proposalId);
+    }
+
+    // Distribute rewards to voters who voted "yes" on a winning proposal
+    function distributeVoterRewards(uint256 proposalId) internal {
+        Proposal storage proposal = proposals[proposalId];
+        uint256 rewardPerVoter = 0.0001 ether; // 10% of the vote deposit as a reward
+
+        // Simplified: Reward the proposer if they voted "yes"
+        if (votedYes[proposalId][proposal.proposer]) {
+            if (address(this).balance >= rewardPerVoter) {
+                payable(proposal.proposer).transfer(rewardPerVoter);
+                emit RewardDistributed(proposal.proposer, rewardPerVoter);
+            }
+        }
+    }
+
+    // Execute proposal and send funds to whitelisted address
+    function executeProposal(uint256 proposalId) external whenNotPaused nonReentrant {
+        Proposal storage proposal = proposals[proposalId];
+        require(isWhitelisted[proposal.nominee], "Not whitelisted");
+        require(!proposal.executed, "Already executed");
+        require(proposal.whitelistedTimestamp > 0, "Not whitelisted yet");
+        require(block.timestamp <= proposal.whitelistedTimestamp + executionTimeLimit, "Execution time limit exceeded");
+
+        proposal.executed = true;
+        uint256 fundingAmount = (address(this).balance * fundingPercentage) / 100;
+        totalFundsReceived[proposal.nominee] += fundingAmount;
+        payable(proposal.nominee).transfer(fundingAmount);
+        emit ProposalExecuted(proposalId, proposal.nominee, fundingAmount);
+    }
+
+    // Mark funds as returned to enable deposit refunds
+    function markFundsReturned() external onlyDeployer {
+        fundsReturned = true;
+        emit FundsReturnedMarked();
+    }
+
+    // Withdraw vote deposits after funds are returned
+    function withdrawVoteDeposit() external whenNotPaused nonReentrant {
+        require(fundsReturned, "Funds not returned yet");
+        uint256 amount = voteDeposits[msg.sender];
+        require(amount > 0, "No deposits to withdraw");
+        voteDeposits[msg.sender] = 0;
+        payable(msg.sender).transfer(amount);
+        emit VoteDepositWithdrawn(msg.sender, amount);
+    }
+
+    // Withdraw deposited (non-staked) MON
+    function withdrawDeposit(uint256 amount) external whenNotPaused nonReentrant {
+        require(depositedAmount[msg.sender] >= amount, "Not enough deposited");
+        depositedAmount[msg.sender] -= amount;
+        votingPower[msg.sender] -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
+    // Update funding percentage (only deployer)
+    function updateFundingPercentage(uint256 newPercentage) external onlyDeployer {
+        require(newPercentage > 0 && newPercentage <= 100, "Invalid percentage");
+        fundingPercentage = newPercentage;
+        emit FundingPercentageUpdated(newPercentage);
+    }
+
+    // Emergency stop mechanism
+    function pause() external onlyDeployer {
+        paused = true;
+        emit Paused();
+    }
+
+    function unpause() external onlyDeployer {
+        paused = false;
+        emit Unpaused();
+    }
+
+    // New: Emergency withdraw for deployer
+    function emergencyWithdraw() external onlyDeployer nonReentrant {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No funds to withdraw");
+        payable(deployer).transfer(balance);
+        emit EmergencyWithdraw(deployer, balance);
+    }
+
+    // Stress-test function to push the chain's limits
+    function stressTest(uint256 iterations) external whenNotPaused {
+        require(iterations <= 1000, "Too many iterations");
+        uint256 temp = 0;
+        for (uint256 i = 0; i < iterations; i++) {
+            temp += i;
+            depositedAmount[msg.sender] += 1;
+            depositedAmount[msg.sender] -= 1;
+        }
+        require(temp >= 0, "Stress test failed");
+    }
+
+    // Check if any proposal is in voting period (optimized)
+    function isVotingActive() internal view returns (bool) {
+        return activeProposalCount > 0;
+    }
+
+    // Check contract balance
+    function getBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+
+    // Get total funds received by an address
+    function getTotalFundsReceived(address user) external view returns (uint256) {
+        return totalFundsReceived[user];
+    }
+
+    // Get slashed amount for an address
+    function getSlashedAmount(address user) external view returns (uint256) {
+        return slashedAmount[user];
+    }
+
+    // Get reputation for an address
+    function getReputation(address user) external view returns (uint256) {
+        return reputation[user];
+    }
+}

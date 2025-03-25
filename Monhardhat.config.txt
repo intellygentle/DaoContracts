@@ -1,0 +1,41 @@
+import { HardhatUserConfig } from "hardhat/config";
+import "@nomicfoundation/hardhat-toolbox";
+import "@nomicfoundation/hardhat-ignition";
+import * as dotenv from "dotenv";
+
+dotenv.config();
+
+const config: HardhatUserConfig = {
+  solidity: {
+    version: "0.8.28",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200,
+      },
+    },
+  },
+  networks: {
+    monad: {
+      url: process.env.MONAD_RPC_URL || "https://monad-rpc-url-here", // Replace with Monad's RPC
+      chainId: 10143,
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY] : [],
+    },
+  },
+  ignition: {
+    // Optional: Customize Ignition settings if needed
+  },
+
+  sourcify: {
+    enabled: true,
+    apiUrl: "https://sourcify-api-monad.blockvision.org",
+    browserUrl: "https://testnet.monadexplorer.com/"
+},
+// To avoid errors from Etherscan
+etherscan: {
+    enabled: false,
+}
+
+};
+
+export default config;
